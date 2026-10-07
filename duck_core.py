@@ -2,8 +2,10 @@
 """
 肉鸭智能化采食行为分析工具 V5.0 —— 核心算法层
 四川农业大学 张雅晨团队 · 大挑项目 · 留种决策模块
-Python 迁移版
+Python 迁移版（对应 duck_tool_V5.R 的函数层）
 """
+from __future__ import annotations
+
 import re
 import numpy as np
 import pandas as pd
@@ -13,13 +15,15 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
+
 import warnings
 warnings.filterwarnings("ignore")
 
 # ============================================================
-# 0. 统一配色（红紫蓝绿）
+# 0.1 统一配色
 # ============================================================
 PAL_RPBG = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#ffff33"]
+
 
 # ============================================================
 # 1. 基础辅助
@@ -30,7 +34,6 @@ def clean_names_simple(cols):
 
 
 def find_col(df, patterns, required=False):
-    """按正则列表查找第一个匹配列名（忽略大小写）"""
     cols = list(df.columns)
     for p in patterns:
         for c in cols:
@@ -44,27 +47,27 @@ def find_col(df, patterns, required=False):
 def safe_numeric(x):
     if pd.api.types.is_numeric_dtype(x):
         return pd.to_numeric(x, errors="coerce")
-    s = (x.astype(str)
-           .str.replace(",", "", regex=False)
-           .str.strip()
+    s = (x.astype(str).str.replace(",", "", regex=False).str.strip()
            .replace({"": np.nan, "NA": np.nan, "NaN": np.nan,
                      "NULL": np.nan, "null": np.nan, "-": np.nan}))
     return pd.to_numeric(s, errors="coerce")
 
 
 def parse_datetime_flexible(x):
-    """兼容 Excel 序列号 / 多种字符串格式"""
+    """兼容 Excel 序列号 / 多种字符串格式（等价 R parse_datetime_flexible）"""
     if pd.api.types.is_datetime64_any_dtype(x):
         return pd.to_datetime(x, errors="coerce")
     if pd.api.types.is_numeric_dtype(x):
         return pd.to_datetime(x, unit="D", origin="1899-12-30", errors="coerce")
     s = x.astype(str).str.strip().replace(
         {"": np.nan, "NA": np.nan, "NaN": np.nan, "NULL": np.nan, "null": np.nan})
-    return pd.to_datetime(s, errors="coerce", dayfirst=False, format="mixed")
+    # 先尝试常见格式，再退回 mixed
+    out = pd.to_datetime(s, errors="coerce", format="mixed")
+    return out
 
 
 def parse_duration_seconds(x):
-    """解析 '1.02:03:04' / '01:02:03' / 'HH:MM' / 数字（天）"""
+    """解析 '1.02:03:04' / 'HH:MM:SS' / 'HH:MM' / 数字（天）"""
     if pd.api.types.is_timedelta64_dtype(x):
         return x.dt.total_seconds()
     if pd.api.types.is_numeric_dtype(x):
@@ -90,21 +93,36 @@ def parse_duration_seconds(x):
     return out
 
 
+def parse_clock_hhmm(x, default="06:00"):
+    if x is None:
+        return default
+    x = str(x).strip()
+    if not x:
+        return default
+    if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", x):
+        parts = [int(p) for p in x.split(":")[:2]]
+        return f"{parts[0]:02d}:{parts[1]:02d}"
+    return default
+
+
+def clock_to_minutes(x):
+    x = parse_clock_hhmm(x)
+    hh, mm = [int(p) for p in x.split(":")]
+    return hh * 60 + mm
+
+
 def safe_mean(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
+    x = np.asarray(x, dtype=float); x = x[np.isfinite(x)]
     return float(np.mean(x)) if len(x) else np.nan
 
 
 def safe_median(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
+    x = np.asarray(x, dtype=float); x = x[np.isfinite(x)]
     return float(np.median(x)) if len(x) else np.nan
 
 
 def safe_sd(x):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
+    x = np.asarray(x, dtype=float); x = x[np.isfinite(x)]
     return float(np.std(x, ddof=1)) if len(x) >= 2 else np.nan
 
 
@@ -115,7 +133,7 @@ def format_p(p):
 
 
 # ============================================================
-# 2. 读取 Excel（全部 sheet，自动匹配字段结构）
+# 2. Excel 读取 + 字段匹配
 # ============================================================
 FEED_PATTERNS = {
     "animal":  [r"^耳标$", r"耳标", r"animal.*id", r"tag"],
@@ -138,28 +156,27 @@ BW_PATTERNS = {
 def _sheet_matches(header_df, patterns):
     if header_df is None or header_df.shape[1] == 0:
         return False
-    h = header_df.copy()
-    h.columns = clean_names_simple(h.columns)
+    h = header_df.copy(); h.columns = clean_names_simple(h.columns)
     return all(find_col(h, p, False) is not None for p in patterns.values())
 
 
 def read_matching_excel_files(files, dataset_type):
     """
-    files: Streamlit UploadedFile 列表 或 [(name, path/bytes)] 列表
-    返回 (合并后 DataFrame, QC 表 DataFrame)
+    files: list of (name, file_bytes_or_path) 或 Streamlit UploadedFile
+    返回 (concat DataFrame, QC DataFrame)
     """
     patterns = FEED_PATTERNS if dataset_type == "feed" else BW_PATTERNS
     result_list, qc_list = [], []
 
     for f in files:
-        name = f.name if hasattr(f, "name") else f[0]
+        name = getattr(f, "name", None) or f[0]
         src = f if hasattr(f, "read") else f[1]
         try:
             xls = pd.ExcelFile(src)
         except Exception as e:
             qc_list.append(dict(数据集=dataset_type, Source_File=name,
-                                Source_Sheet="-", 状态="读取失败", 读取记录数=0,
-                                说明=str(e)))
+                                Source_Sheet="-", 状态="读取失败",
+                                读取记录数=0, 说明=str(e)))
             continue
 
         for sheet in xls.sheet_names:
@@ -206,12 +223,11 @@ def read_matching_excel_files(files, dataset_type):
 
 
 def read_pedigree(path):
-    """系谱：翅号 / 父本笼号 / 母本笼号 / 性别"""
     if path is None:
         return pd.DataFrame(columns=["ID", "Sire_Cage", "Dam_Cage", "Sex"])
     ped = pd.read_excel(path)
     ped.columns = clean_names_simple(ped.columns)
-    id_col  = find_col(ped, [r"^翅号$", r"翅号", r"id", r"animal"], required=True)
+    id_col   = find_col(ped, [r"^翅号$", r"翅号", r"id", r"animal"], required=True)
     sire_col = find_col(ped, [r"^父本笼号$", r"父本", r"sire", r"father"])
     dam_col  = find_col(ped, [r"^母本笼号$", r"母本", r"dam", r"mother"])
     sex_col  = find_col(ped, [r"^性别$", r"性别", r"sex"])
@@ -226,7 +242,6 @@ def read_pedigree(path):
 
 
 def read_idmap(path):
-    """eID - ID 对照表"""
     if path is None:
         return pd.DataFrame(columns=["eID", "ID"])
     m = pd.read_excel(path)
@@ -239,18 +254,15 @@ def read_idmap(path):
 
 
 def link_animals(feed, bw, ped, idmap):
-    """eID → ID(翅号) → 系谱"""
     feed_ids = set(feed["Animal_ID"].astype(str))
     bw_ids   = set(bw["Animal_ID"].astype(str))
     both = sorted(feed_ids & bw_ids)
-
     if idmap is None or len(idmap) == 0 or ped is None or len(ped) == 0:
         return pd.DataFrame({
             "eID": both, "ID": both,
             "Sire_Cage": np.nan, "Dam_Cage": np.nan, "Sex": np.nan,
             "Has_Pedigree": False, "Has_Both_Data": True,
         })
-
     mapped = idmap[idmap["eID"].isin(both)].copy()
     mapped = mapped.merge(ped, on="ID", how="left")
     mapped["Has_Pedigree"] = mapped["Sire_Cage"].notna() | mapped["Dam_Cage"].notna()
@@ -263,8 +275,9 @@ def link_animals(feed, bw, ped, idmap):
 # ============================================================
 
 def make_experimental_week(dt_series, start_dt, week_length):
-    dt = pd.to_datetime(dt_series)
-    day_num = np.floor((dt - pd.to_datetime(start_dt)).dt.total_seconds() / 86400).astype(int) + 1
+    dt = pd.to_datetime(dt_series, errors="coerce")
+    start = pd.to_datetime(start_dt)
+    day_num = np.floor((dt - start).dt.total_seconds() / 86400).astype(int) + 1
     week_num = np.floor((day_num - 1) / week_length).astype(int) + 1
     return pd.DataFrame({
         "Experimental_Day": day_num.values,
@@ -291,7 +304,6 @@ def remove_weekly_outliers(dat, value_col, week_col="Week_Number", sd_multiplier
 
 
 def run_clean_v5(feed_raw, bw_raw, cfg):
-    """返回 dict: feed, bw, datetime_qc, na_qc, feed_week_stats, bw_week_stats"""
     # ---------- 采食 ----------
     feed = feed_raw.copy()
     feed.columns = clean_names_simple(feed.columns)
@@ -319,24 +331,24 @@ def run_clean_v5(feed_raw, bw_raw, cfg):
     t_min, t_max = feed["Time1"].min(), feed["Time1"].max()
     datetime_qc = pd.DataFrame({"Start": [t_min], "End": [t_max], "N": [len(feed)]})
 
-    # 自动时间范围
     if cfg.get("auto_time_range", True):
         cfg["experiment_start"] = t_min.date()
         cfg["training_end"] = t_max.date()
         cfg["training_time"] = t_max.strftime("%H:%M:%S")
 
-    # NA QC（全部字段）
     na_rows = []
     for c in feed.columns:
         v = feed[c]
-        n_na = int(v.isna().sum()) if pd.api.types.is_numeric_dtype(v) or pd.api.types.is_datetime64_any_dtype(v) \
-               else int((v.isna() | v.astype(str).str.strip().eq("")).sum())
+        if pd.api.types.is_numeric_dtype(v) or pd.api.types.is_datetime64_any_dtype(v):
+            n_na = int(v.isna().sum())
+        else:
+            n_na = int((v.isna() | v.astype(str).str.strip().eq("")).sum())
         na_rows.append(dict(字段=c, 类型=str(v.dtype), 缺失数=n_na,
                             记录数=len(feed), 缺失率=round(n_na / max(len(feed), 1) * 100, 2)))
     na_qc = pd.DataFrame(na_rows)
 
-    # 截止时间
     training_end = cfg.get("training_end")
+    end_dt = None
     if training_end is not None and not pd.isna(training_end):
         end_dt = pd.to_datetime(f"{training_end} {cfg.get('training_time', '00:00:00')}")
         feed = feed[feed["Time1"] <= end_dt]
@@ -383,7 +395,7 @@ def run_clean_v5(feed_raw, bw_raw, cfg):
     bw = bw[bw["Animal_ID"].str.strip().ne("") &
             bw["Time1"].notna() & bw["BW_kg"].notna()].reset_index(drop=True)
 
-    if training_end is not None and not pd.isna(training_end):
+    if end_dt is not None:
         bw = bw[bw["Time1"] <= end_dt]
     if start_dt is not None and not pd.isna(start_dt):
         bw = bw[bw["Time1"].dt.date >= pd.to_datetime(start_dt).date()]
@@ -397,7 +409,6 @@ def run_clean_v5(feed_raw, bw_raw, cfg):
                 feed_week_stats=feed_week_stats, bw_week_stats=bw_week_stats)
 
 
-# ---------- bout 划分 ----------
 def build_bouts(feed, imi_threshold_sec=300, min_intake_g=1):
     df = feed.sort_values(["Animal_ID", "Time1"]).copy()
     df["Gap_sec"] = df.groupby("Animal_ID")["Time1"].diff().dt.total_seconds()
@@ -449,7 +460,6 @@ def calc_production(feed, bw, individual_feeding):
     bw_terminal["ADG_g"] = np.where(bw_terminal["Test_Days"] > 0,
                                     bw_terminal["Gain_kg"] * 1000 / bw_terminal["Test_Days"], np.nan)
 
-    # ADG 稳健过滤（4*MAD）
     adg = bw_terminal["ADG_g"]
     adg_med = adg.median()
     adg_mad = (adg - adg_med).abs().median() * 1.4826
@@ -463,7 +473,6 @@ def calc_production(feed, bw, individual_feeding):
     prod["FCR"] = np.where(prod["Gain_kg"] > 0, prod["ADFI_g"] / prod["ADG_g"], np.nan)
     prod["Feed_Efficiency"] = 1 / prod["FCR"]
 
-    # RFI
     sub = prod[prod["ADG_g"].notna() & prod["MBW"].notna() & prod["ADFI_g"].notna()].copy()
     if len(sub) >= 20:
         X = np.column_stack([np.ones(len(sub)), sub["ADG_g"], sub["MBW"]])
@@ -484,7 +493,6 @@ def assign_hff_lff(prod, method="median", cutoff=None):
     return d, cutoff
 
 
-# ---------- 节律 ----------
 def calc_rhythm(bout):
     daily = (bout.groupby("Date")
                  .apply(lambda x: len(x) / x["Animal_ID"].nunique())
@@ -518,14 +526,8 @@ def calc_weekly_fcr(feed, bw, week_length=7):
              .reset_index(name="Weekly_FCR"))
 
 
-# ---------- 创新行为指标 ----------
-def _clock_to_minutes(s):
-    parts = [int(p) for p in str(s).split(":")[:2]]
-    return parts[0] * 60 + parts[1]
-
-
 def compute_daynight_v5(bout, day_start="06:00", day_end="18:00"):
-    ds, de = _clock_to_minutes(day_start), _clock_to_minutes(day_end)
+    ds, de = clock_to_minutes(day_start), clock_to_minutes(day_end)
     mins = bout["Time1"].dt.hour * 60 + bout["Time1"].dt.minute
     if ds < de:
         is_day = (mins >= ds) & (mins < de)
@@ -585,15 +587,15 @@ def compute_behavior_cv_v5(bout, min_bouts_single=20, min_days_daily=3):
 
 def compute_cosinor_v5(bout, min_bouts=20):
     b = bout.assign(Hour_Block=bout["Time1"].dt.hour)
-    hourly = (b.groupby(["Animal_ID", "Hour_Block"]).size()
-                .reset_index(name="n"))
-    full_idx = pd.MultiIndex.from_product([hourly["Animal_ID"].unique(), range(24)],
-                                          names=["Animal_ID", "Hour_Block"])
-    hourly = (hourly.set_index(["Animal_ID", "Hour_Block"])
-                    .reindex(full_idx, fill_value=0).reset_index())
+    cnt = b.groupby(["Animal_ID", "Hour_Block"]).size().reset_index(name="n")
+    animals = cnt["Animal_ID"].unique()
+    full = pd.MultiIndex.from_product([animals, range(24)],
+                                       names=["Animal_ID", "Hour_Block"])
+    cnt = (cnt.set_index(["Animal_ID", "Hour_Block"]).reindex(full, fill_value=0)
+              .reset_index())
 
     rows = []
-    for aid, g in hourly.groupby("Animal_ID"):
+    for aid, g in cnt.groupby("Animal_ID"):
         t = g["Hour_Block"].values.astype(float)
         y = g["n"].values.astype(float)
         if y.sum() < min_bouts:
@@ -615,12 +617,15 @@ def compute_cosinor_v5(bout, min_bouts=20):
 
 def compute_fano_v5(bout):
     b = bout.assign(Hour_Block=bout["Time1"].dt.hour)
-    cnt = (b.groupby(["Animal_ID", "Date", "Hour_Block"]).size()
-             .reset_index(name="n"))
-    full = (cnt.set_index(["Animal_ID", "Date", "Hour_Block"])["n"]
-               .groupby(level=[0, 1])
-               .apply(lambda s: s.reindex(range(24), fill_value=0))
-               .reset_index(name="n"))
+    cnt = b.groupby(["Animal_ID", "Date", "Hour_Block"]).size().reset_index(name="n")
+    # 补齐每小时
+    full_parts = []
+    for (aid, d), g in cnt.groupby(["Animal_ID", "Date"]):
+        s = g.set_index("Hour_Block")["n"].reindex(range(24), fill_value=0)
+        full_parts.append(pd.DataFrame({"Animal_ID": aid, "Date": d,
+                                        "Hour_Block": s.index, "n": s.values}))
+    full = pd.concat(full_parts, ignore_index=True) if full_parts else pd.DataFrame(
+        columns=["Animal_ID", "Date", "Hour_Block", "n"])
     out = full.groupby("Animal_ID")["n"].agg(
         N_Hour_Cells="size",
         Mean_Bouts_Per_Hour="mean",
@@ -761,12 +766,15 @@ def run_pblup(prod, ped, trait, h2=0.3, fixed_effects=("Sex",), id_col="Animal_I
     LHS = np.block([[X.T @ X, X.T @ Z],
                     [Z.T @ X, Z.T @ Z + lam * Ai]])
     RHS = np.concatenate([X.T @ y, Z.T @ y])
-    sol = np.linalg.solve(LHS, RHS)
-    b = sol[:X.shape[1]]
-    u = sol[X.shape[1]:]
+    try:
+        sol = np.linalg.solve(LHS, RHS)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.lstsq(LHS, RHS, rcond=None)[0]
 
+    u = sol[X.shape[1]:]
     out = pd.DataFrame({"Animal_ID": animals, "EBV": u})
-    out = out.merge(dat[[id_col, trait] + (["Sex"] if "Sex" in dat.columns else [])],
+    cols_keep = [id_col, trait] + (["Sex"] if "Sex" in dat.columns else [])
+    out = out.merge(dat[cols_keep].drop_duplicates(id_col),
                     left_on="Animal_ID", right_on=id_col, how="left")
     return dict(result=out, h2=h2, lambda_=lam, n_animals=len(animals),
                 fixed=fe_cols, A=A)
@@ -797,7 +805,6 @@ def run_pblup_multi(prod, ped, traits, h2_by_trait=None, fixed_effects=("Sex",),
 
 
 def estimate_h2_reml(prod, ped, trait, fixed_effects=("Sex",), id_col="Animal_ID"):
-    """直接最大化 REML 对数似然（对数参数化）"""
     dat = prod[prod[trait].notna()].copy()
     if len(dat) < 10:
         raise ValueError("遗传力估计需要至少 10 个有表型的个体。")
@@ -833,12 +840,15 @@ def estimate_h2_reml(prod, ped, trait, fixed_effects=("Sex",), id_col="Animal_ID
         except np.linalg.LinAlgError:
             Vi = np.linalg.pinv(V)
         M = X.T @ Vi @ X
-        sign_v, logdetV = np.linalg.slogdet(V)
-        sign_m, logdetM = np.linalg.slogdet(M)
-        if sign_v <= 0 or sign_m <= 0:
+        try:
+            sign_v, logdetV = np.linalg.slogdet(V)
+            sign_m, logdetM = np.linalg.slogdet(M)
+            if sign_v <= 0 or sign_m <= 0:
+                return 1e12
+            ytVi = y @ Vi
+            ytPy = ytVi @ y - ytVi @ X @ np.linalg.solve(M, X.T @ Vi @ y)
+        except Exception:
             return 1e12
-        ytVi = y @ Vi
-        ytPy = ytVi @ y - ytVi @ X @ np.linalg.solve(M, X.T @ Vi @ y)
         return 0.5 * (logdetV + logdetM + ytPy)
 
     par0 = np.log([0.3 * var_y, 0.7 * var_y])
@@ -848,7 +858,7 @@ def estimate_h2_reml(prod, ped, trait, fixed_effects=("Sex",), id_col="Animal_ID
     h2 = s2a / (s2a + s2e)
     return dict(trait=trait, h2=h2, sigma2_a=s2a, sigma2_e=s2e,
                 n_animals=len(animals), n_obs=n,
-                n_iter=int(res.nit), converged=res.success)
+                n_iter=int(res.nit), converged=bool(res.success))
 
 
 def estimate_h2_multi(prod, ped, traits, fixed_effects=("Sex",), id_col="Animal_ID"):
@@ -933,8 +943,7 @@ def select_lit_indicator_traits(targets, prod, max_n=5):
     res["Abs_r"] = res["Genetic_r"].abs()
     res = (res.sort_values("Abs_r", ascending=False)
               .drop_duplicates("Indicator", keep="first")
-              .head(max_n)
-              .reset_index(drop=True))
+              .head(max_n).reset_index(drop=True))
     res["N"] = np.nan
     res["Spearman_r"] = np.nan
     res["P"] = np.nan
@@ -977,9 +986,8 @@ def run_literature_index(prod, target_trait, lit, weights=None, traits_subset=No
     return dict(index=idx, ebv=ebv, h2_used=h2_used)
 
 
-# ---------- 选择指数 ----------
+# ---------- 性状元信息 ----------
 TRAIT_META = pd.DataFrame([
-    # Trait, Label, Dir
     ("FCR", "饲料转化比", -1), ("RFI", "剩余采食量", -1), ("ADFI_g", "平均日采食量", -1),
     ("FI_Day_g", "日采食量", -1), ("TFD_sec", "总采食时长", -1), ("AFBD_sec", "单次采食时长", -1),
     ("IMI_sec", "餐间间隔", -1), ("FR_g_sec", "采食速率", 1), ("TFB_Day", "日访饲次数", 1),
@@ -1078,7 +1086,7 @@ def make_retention_list(index_df, prod, retention_ratio=0.3, sex_balance=False,
 
 def run_retention_module(prod, link, cfg):
     warnings_list = []
-    target = cfg.get("target_trait", ["FCR"])
+    target = cfg.get("target_trait") or "FCR"
     if isinstance(target, str):
         target = [target]
     target = [t for t in target if t and t != "---"]
@@ -1106,7 +1114,8 @@ def run_retention_module(prod, link, cfg):
             f"系谱可用个体不足 20（当前 {n_has_ped} 只），已自动切换为『文献参数』路线。")
 
     genetic = dict(mode="PBLUP" if use_ped else "文献参数")
-    retention = None    idx = None
+    retention = None
+    idx = None
     ratio = cfg.get("retention_ratio", 0.3)
     sex_balance = bool(cfg.get("sex_balance", False))
 
@@ -1219,7 +1228,7 @@ def run_pipeline_v5(feed_files, bw_files, ped_path, idmap_path, cfg):
     bout = build_bouts(clean["feed"], cfg["imi_threshold"], cfg["min_intake"])
     ind_feeding = calc_individual_feeding(bout)
     prod = calc_production(clean["feed"], clean["bw"], ind_feeding)
-    prod, _ = assign_hff_lff(prod, cfg.get("hff_method", "median"), cfg.get("hff_cutoff"))
+    prod, _cutoff = assign_hff_lff(prod, cfg.get("hff_method", "median"), cfg.get("hff_cutoff"))
     prod["HFF"] = (prod["Feed_Frequency_Group"] == "HFF").astype(int)
 
     prod = (prod.merge(compute_daynight_v5(bout, cfg.get("day_start", "06:00"),
@@ -1254,7 +1263,7 @@ def run_pipeline_v5(feed_files, bw_files, ped_path, idmap_path, cfg):
 
 
 # ============================================================
-# 6. AI 智能选种探索
+# 6. AI 智能选种探索（对应 R 模块⑥）
 # ============================================================
 def ml_feature_groups_v5():
     return {
@@ -1371,7 +1380,7 @@ def ml_single_target(prod, target, features, seed=123, ntree=300, nrounds=120):
 
 
 def ml_fusion(target_results, w_target=None):
-    names = [k for k, v in target_results.items() if v and "importance" in v]
+    names = [k for k, v in target_results.items() if v and v.get("importance") is not None]
     if not names:
         return dict(error="所有目标的 RF 重要性均失败，无法融合。")
     if w_target is None or len(w_target) != len(names):
@@ -1521,6 +1530,36 @@ SIMPLE_GOAL_MAP = {
 }
 
 
+def flag_anomalies(prod, index_df=None):
+    out = []
+    if "Day_Bout_Ratio" in prod.columns and "TFB_Day" in prod.columns:
+        thr = prod["TFB_Day"].quantile(0.05)
+        mask = (prod["Day_Bout_Ratio"] > 0.97) | (prod["TFB_Day"] < thr)
+        d = prod.loc[mask, ["Animal_ID"]].copy()
+        d["异常类型"] = "采食节律异常"
+        d["具体表现"] = np.where(prod.loc[mask, "Day_Bout_Ratio"] > 0.97,
+                                "夜间几乎不采食（白天占比>97%）",
+                                "日访饲次数过低（群体最低5%）")
+        if len(d): out.append(d)
+    if "Gain_kg" in prod.columns:
+        thr = prod["Gain_kg"].quantile(0.05)
+        mask = prod["Gain_kg"] < thr
+        d = prod.loc[mask, ["Animal_ID"]].copy()
+        d["异常类型"] = "体重增长异常"
+        d["具体表现"] = "总增重过低（群体最低5%）"
+        if len(d): out.append(d)
+    if index_df is not None and "Index" in index_df.columns:
+        thr = index_df["Index"].quantile(0.05)
+        mask = index_df["Index"] < thr
+        d = index_df.loc[mask, ["Animal_ID"]].copy()
+        d["异常类型"] = "综合得分极低"
+        d["具体表现"] = "综合得分处于群体最低5%"
+        if len(d): out.append(d)
+    if not out:
+        return pd.DataFrame(columns=["Animal_ID", "异常类型", "具体表现"])
+    return pd.concat(out, ignore_index=True).drop_duplicates().reset_index(drop=True)
+
+
 def run_simple_all(feed_files, bw_files, ped_path=None, idmap_path=None,
                    goals=("save",), ratio=0.3, sex_balance=True,
                    auto_time=True, experiment_start=None,
@@ -1579,7 +1618,7 @@ def run_simple_all(feed_files, bw_files, ped_path=None, idmap_path=None,
         for t in idx_traits:
             if t not in meas: w[t] = 0.3 / n_ind
     else:
-        for t in idx_traits: w[t] = 1.0 / len(idx_traits)
+        for t in idx_traits: w[t] = 1.0 / max(len(idx_traits), 1)
 
     cfg["index_traits"] = idx_traits
     cfg["weights"] = w
@@ -1619,30 +1658,3 @@ def run_simple_all(feed_files, bw_files, ped_path=None, idmap_path=None,
              anomalies=flag_anomalies(prod, A["all_index"]))
 
     return dict(A=A, B=B, C=C, prod=prod, elapsed=time.time() - t0)
-
-
-def flag_anomalies(prod, index_df=None):
-    out = []
-    if "Day_Bout_Ratio" in prod.columns and "TFB_Day" in prod.columns:
-        thr = prod["TFB_Day"].quantile(0.05)
-        d = prod[(prod["Day_Bout_Ratio"] > 0.97) | (prod["TFB_Day"] < thr)][["Animal_ID"]].copy()
-        d["异常类型"] = "采食节律异常"
-        d["具体表现"] = np.where(prod.loc[d.index, "Day_Bout_Ratio"] > 0.97,
-                                "夜间几乎不采食（白天占比>97%）",
-                                "日访饲次数过低（群体最低5%）")
-        if len(d): out.append(d)
-    if "Gain_kg" in prod.columns:
-        thr = prod["Gain_kg"].quantile(0.05)
-        d = prod[prod["Gain_kg"] < thr][["Animal_ID"]].copy()
-        d["异常类型"] = "体重增长异常"
-        d["具体表现"] = "总增重过低（群体最低5%）"
-        if len(d): out.append(d)
-    if index_df is not None and "Index" in index_df.columns:
-        thr = index_df["Index"].quantile(0.05)
-        d = index_df[index_df["Index"] < thr][["Animal_ID"]].copy()
-        d["异常类型"] = "综合得分极低"
-        d["具体表现"] = "综合得分处于群体最低5%"
-        if len(d): out.append(d)
-    if not out:
-        return pd.DataFrame(columns=["Animal_ID", "异常类型", "具体表现"])
-    return pd.concat(out, ignore_index=True).drop_duplicates().reset_index(drop=True)
