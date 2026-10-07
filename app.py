@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""鸭芯智选 · 肉鸭智能化采食行为分析工具 V5.0 —— Streamlit 界面"""
+"""
+鸭芯智选 · 肉鸭智能化采食行为分析工具 V5.0
+Streamlit 界面（等价 R 版 ui + server）
+"""
 import io
 import numpy as np
 import pandas as pd
@@ -10,8 +13,8 @@ import plotly.graph_objects as go
 
 import duck_core as dc
 
-# 中文字体（Linux 服务器若无中文字体，可换成 'DejaVu Sans' 或安装思源黑体）
-plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+# 中文字体（Streamlit Cloud 上用内置 DejaVu Sans；有中文字体可换 SimHei）
+plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "SimHei", "Microsoft YaHei"]
 plt.rcParams["axes.unicode_minus"] = False
 
 st.set_page_config(page_title="鸭芯智选 V5.0", layout="wide",
@@ -21,15 +24,23 @@ PAL = dc.PAL_RPBG
 
 
 # ============================================================
-# 通用工具
+# 工具函数
 # ============================================================
 def df_to_excel_bytes(sheets: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for name, df in sheets.items():
             if df is not None and len(df) > 0:
-                df.to_excel(w, sheet_name=name[:31], index=False)
+                df.to_excel(w, sheet_name=str(name)[:31], index=False)
     return buf.getvalue()
+
+
+def dl_button(df, filename, label="下载 Excel", key=None):
+    if df is None or len(df) == 0:
+        return
+    st.download_button(label, df_to_excel_bytes({"Sheet1": df}), filename,
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       key=key)
 
 
 def show_df(df, height=400, key=None):
@@ -39,27 +50,15 @@ def show_df(df, height=400, key=None):
     st.dataframe(df, use_container_width=True, height=height, key=key)
 
 
-def dl_button(df, filename, label="下载 Excel"):
-    if df is None or len(df) == 0:
-        return
-    st.download_button(label, df_to_excel_bytes({"Sheet1": df}), filename,
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-def mpl_to_st(fig):
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
-
-
 # ============================================================
-# 侧边栏：模式切换
+# 侧栏：模式选择
 # ============================================================
 st.sidebar.title("🦆 鸭芯智选 V5.0")
 mode = st.sidebar.radio("选择模式", ["🦆 简单模式", "🔬 专家模式"], index=0)
 
 
 # ============================================================
-# 简单模式
+# 🦆 简单模式
 # ============================================================
 if mode == "🦆 简单模式":
     st.title("🦆 简单模式：一键选留种鸭")
@@ -74,11 +73,12 @@ if mode == "🦆 简单模式":
         simp_ped = st.file_uploader("系谱（可选，有系谱更准）", type=["xls", "xlsx"], key="simp_ped")
         simp_idmap = st.file_uploader("ID对照表（可选）", type=["xls", "xlsx"], key="simp_idmap")
 
-        st.header("时间范围")
+        st.header("时间范围（可选）")
         simp_auto_time = st.checkbox("自动使用数据全部时间（默认）", value=True)
         simp_start = None
         if not simp_auto_time:
-            simp_start = st.date_input("试验开始日期", pd.Timestamp.today() - pd.Timedelta(days=30))
+            simp_start = st.date_input("试验开始日期",
+                                       pd.Timestamp.today() - pd.Timedelta(days=30))
 
         st.header("② 育种目标（可多选）")
         goal_save = st.checkbox("吃得省（料重比低、省饲料）", value=True)
@@ -120,7 +120,7 @@ if mode == "🦆 简单模式":
                         experiment_start=simp_start)
                     st.session_state["simple_res"] = res
                 except Exception as e:
-                    st.error(f"运行失败：{e}")
+                    st.exception(e)
                     st.session_state.pop("simple_res", None)
 
     res = st.session_state.get("simple_res")
@@ -180,20 +180,22 @@ if mode == "🦆 简单模式":
 
         with tabC:
             st.subheader("日访饲节律")
-            fig = px.line(C["rhythm_daily"], x="Date", y="Mean_Bouts_Per_Duck", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
+            if C["rhythm_daily"] is not None and len(C["rhythm_daily"]) > 0:
+                fig = px.line(C["rhythm_daily"], x="Date", y="Mean_Bouts_Per_Duck", markers=True)
+                st.plotly_chart(fig, use_container_width=True)
             st.subheader("24 小时访饲节律（按周）")
-            fig = px.line(C["rhythm_hourly"], x="Hour_Block", y="Mean_Bouts_Per_Duck",
-                          color="Week_Number", markers=True)
-            fig.update_xaxes(dtick=1)
-            st.plotly_chart(fig, use_container_width=True)
+            if C["rhythm_hourly"] is not None and len(C["rhythm_hourly"]) > 0:
+                fig = px.line(C["rhythm_hourly"], x="Hour_Block", y="Mean_Bouts_Per_Duck",
+                              color="Week_Number", markers=True)
+                fig.update_xaxes(dtick=1)
+                st.plotly_chart(fig, use_container_width=True)
             st.subheader("昼夜分配"); show_df(C["daynight"])
             st.subheader("行为变异性"); show_df(C["cv"])
             st.subheader("异常个体预警（暂缓复测，不淘汰）"); show_df(C["anomalies"])
 
 
 # ============================================================
-# 专家模式
+# 🔬 专家模式
 # ============================================================
 else:
     st.title("🔬 专家模式")
@@ -255,7 +257,7 @@ else:
                         rv = dc.run_pipeline_v5(feed_files, bw_files, ped_file, idmap_file, cfg)
                         st.session_state["pipe"] = rv
                     except Exception as e:
-                        st.error(f"清洗失败：{e}")
+                        st.exception(e)
 
         rv = st.session_state.get("pipe")
         if rv:
@@ -347,14 +349,16 @@ else:
                     RFI=("RFI", "mean")).round(2).reset_index()
                 st.dataframe(cmp)
                 st.subheader("访饲节律（日）")
-                st.plotly_chart(px.line(rv["rhythm"]["daily"], x="Date",
-                                        y="Mean_Bouts_Per_Duck", markers=True),
-                                use_container_width=True)
+                if len(rv["rhythm"]["daily"]) > 0:
+                    st.plotly_chart(px.line(rv["rhythm"]["daily"], x="Date",
+                                            y="Mean_Bouts_Per_Duck", markers=True),
+                                    use_container_width=True)
                 st.subheader("访饲节律（24h）")
-                st.plotly_chart(px.line(rv["rhythm"]["hourly"], x="Hour_Block",
-                                        y="Mean_Bouts_Per_Duck",
-                                        color="Week_Number", markers=True),
-                                use_container_width=True)
+                if len(rv["rhythm"]["hourly"]) > 0:
+                    st.plotly_chart(px.line(rv["rhythm"]["hourly"], x="Hour_Block",
+                                            y="Mean_Bouts_Per_Duck",
+                                            color="Week_Number", markers=True),
+                                    use_container_width=True)
                 st.subheader("每周 FCR")
                 show_df(rv["weekly_fcr"])
 
@@ -389,8 +393,9 @@ else:
                 show_df(prod[cols])
                 if "Day_FI_Ratio" in prod.columns and "FCR" in prod.columns:
                     d = prod.dropna(subset=["Day_FI_Ratio", "FCR"])
-                    fig = px.scatter(d, x="Day_FI_Ratio", y="FCR", trendline="ols")
-                    st.plotly_chart(fig, use_container_width=True)
+                    if len(d) > 0:
+                        fig = px.scatter(d, x="Day_FI_Ratio", y="FCR", trendline="ols")
+                        st.plotly_chart(fig, use_container_width=True)
             with t2:
                 cols = [c for c in ["Animal_ID", "CV_Duration", "CV_FR", "Robust_CV_IMI",
                                     "CV_Daily_Bouts", "CV_Daily_FI", "CV_Daily_TFD"]
@@ -412,12 +417,15 @@ else:
                                      "Cosinor_A", "Fano"] if c in prod.columns]
                 rows = []
                 for v in innov:
-                    tmp = prod[[v, "FCR"]].dropna() if "FCR" in prod.columns else pd.DataFrame()
+                    if "FCR" not in prod.columns:
+                        break
+                    tmp = prod[[v, "FCR"]].dropna()
                     if len(tmp) >= 5:
                         r, p = dc.stats.spearmanr(tmp[v], tmp["FCR"])
                         rows.append(dict(创新指标=v, Spearman_r=round(r, 3),
                                          P_value=dc.format_p(p), N=len(tmp)))
-                show_df(pd.DataFrame(rows))
+                if rows:
+                    show_df(pd.DataFrame(rows))
 
     # ---------- ⑤ 遗传评估与留种 ----------
     with mods[4]:
@@ -486,7 +494,7 @@ else:
                         if rr.get("error"):
                             st.error(rr["error"])
                     except Exception as e:
-                        st.error(f"遗传评估失败：{e}")
+                        st.exception(e)
 
             if rv.get("key_metrics") is not None:
                 st.subheader("关键指标卡")
@@ -530,7 +538,7 @@ else:
                 ml_targets = st.multiselect("预测目标性状",
                                             ["ADG_g", "FCR", "RFI"],
                                             default=["ADG_g", "FCR", "RFI"])
-                st.subheader("目标权重（Trait_score 融合）")
+                st.subheader("目标权重")
                 w_adg = st.number_input("ADG 权重", 0.0, 1.0, 0.33, step=0.05)
                 w_fcr = st.number_input("FCR 权重", 0.0, 1.0, 0.33, step=0.05)
                 w_rfi = st.number_input("RFI 权重", 0.0, 1.0, 0.34, step=0.05)
